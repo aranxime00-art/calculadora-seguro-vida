@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -6,44 +5,30 @@ import matplotlib.pyplot as plt
 st.set_page_config(page_title="Calculadora de Seguro de Vida", layout="centered")
 
 st.title("Calculadora de Seguro de Vida")
-st.write("Cálculo de prima, reserva matemática y gráfica de reservas.")
+st.write("Prima neta, prima comercial y reserva matemática prospectiva usando tabla de mortalidad real.")
 
-# -----------------------------
-# Tabla de mortalidad sencilla
-# -----------------------------
-def crear_tabla_mortalidad():
-    edades = list(range(18, 101))
-    qx = []
+@st.cache_data
+def cargar_tabla_mortalidad():
+    tabla = pd.read_excel("Mort.xlsx")
 
-    for edad in edades:
-        if edad < 30:
-            qx.append(0.001)
-        elif edad < 40:
-            qx.append(0.002)
-        elif edad < 50:
-            qx.append(0.004)
-        elif edad < 60:
-            qx.append(0.008)
-        elif edad < 70:
-            qx.append(0.015)
-        elif edad < 80:
-            qx.append(0.035)
-        elif edad < 90:
-            qx.append(0.080)
-        else:
-            qx.append(0.150)
-
-    return pd.DataFrame({
-        "Edad": edades,
-        "qx": qx
+    tabla = tabla.rename(columns={
+        "x": "Edad",
+        "Q(x)": "qx",
+        "L(x)": "lx",
+        "D(x)": "dx"
     })
 
+    tabla = tabla[["Edad", "qx", "lx", "dx"]].dropna()
+    tabla["Edad"] = tabla["Edad"].astype(int)
+    tabla["qx"] = tabla["qx"].astype(float)
+    tabla["lx"] = tabla["lx"].astype(float)
+    tabla["dx"] = tabla["dx"].astype(float)
 
-tabla_mortalidad = crear_tabla_mortalidad()
+    return tabla.sort_values("Edad").reset_index(drop=True)
 
-# -----------------------------
-# Entradas
-# -----------------------------
+
+tabla_mortalidad = cargar_tabla_mortalidad()
+
 st.sidebar.header("Datos del seguro")
 
 edad = st.sidebar.number_input(
@@ -76,107 +61,96 @@ tasa = st.sidebar.number_input(
     step=0.01
 )
 
-gastos_admin = st.sidebar.number_input(
-    "Gastos de administración",
-    min_value=0.0,
-    max_value=1.0,
-    value=0.08,
-    step=0.01
-)
+gastos_admin = st.sidebar.number_input("Gastos de administración", 0.0, 1.0, 0.08, 0.01)
+gastos_adquisicion = st.sidebar.number_input("Gastos de adquisición", 0.0, 1.0, 0.10, 0.01)
+utilidad = st.sidebar.number_input("Utilidad", 0.0, 1.0, 0.15, 0.01)
 
-gastos_adquisicion = st.sidebar.number_input(
-    "Gastos de adquisición",
-    min_value=0.0,
-    max_value=1.0,
-    value=0.10,
-    step=0.01
-)
 
-utilidad = st.sidebar.number_input(
-    "Utilidad",
-    min_value=0.0,
-    max_value=1.0,
-    value=0.15,
-    step=0.01
-)
+def lx(tabla, edad):
+    fila = tabla[tabla["Edad"] == edad]
+    if fila.empty:
+        return None
+    return fila["lx"].values[0]
 
-# -----------------------------
-# Función de prima pura de riesgo
-# -----------------------------
-def calcular_prima_riesgo(edad, plazo, suma_asegurada, tasa, tabla):
-    valor_actual_beneficios = 0
-    valor_actual_primas = 0
 
-    for t in range(plazo):
-        edad_actual = edad + t
+def qx(tabla, edad):
+    fila = tabla[tabla["Edad"] == edad]
+    if fila.empty:
+        return None
+    return fila["qx"].values[0]
 
-        if edad_actual not in tabla["Edad"].values:
+
+def seguro_temporal(edad, plazo, tasa, tabla):
+    v = 1 / (1 + tasa)
+    lx_inicial = lx(tabla, edad)
+    valor = 0
+
+    for k in range(plazo):
+        lx_k = lx(tabla, edad + k)
+        qx_k = qx(tabla, edad + k)
+
+        if lx_k is None or qx_k is None:
             break
 
-        qx = tabla.loc[tabla["Edad"] == edad_actual, "qx"].values[0]
-        v = 1 / ((1 + tasa) ** (t + 1))
+        kpx = lx_k / lx_inicial
+        valor += (v ** (k + 1)) * kpx * qx_k
 
-        valor_actual_beneficios += suma_asegurada * qx * v
-        valor_actual_primas += v
-
-    if valor_actual_primas == 0:
-        return 0
-
-    prima_riesgo = valor_actual_beneficios / valor_actual_primas
-    return prima_riesgo
+    return valor
 
 
-# -----------------------------
-# Función de reserva matemática
-# -----------------------------
-def calcular_reservas(edad, plazo, suma_asegurada, prima_riesgo, tasa, tabla):
+def anualidad_temporal(edad, plazo, tasa, tabla):
+    v = 1 / (1 + tasa)
+    lx_inicial = lx(tabla, edad)
+    valor = 0
+
+    for k in range(plazo):
+        lx_k = lx(tabla, edad + k)
+
+        if lx_k is None:
+            break
+
+        kpx = lx_k / lx_inicial
+        valor += (v ** k) * kpx
+
+    return valor
+
+
+def calcular_reservas(edad, plazo, suma_asegurada, prima_neta, tasa, tabla):
     reservas = []
 
     for t in range(plazo + 1):
-        valor_actual_beneficios = 0
-        valor_actual_primas_futuras = 0
+        edad_t = edad + t
+        plazo_restante = plazo - t
 
-        for k in range(t, plazo):
-            edad_actual = edad + k
+        if plazo_restante == 0:
+            reservas.append(0)
+            continue
 
-            if edad_actual not in tabla["Edad"].values:
-                break
+        A = seguro_temporal(edad_t, plazo_restante, tasa, tabla)
+        a = anualidad_temporal(edad_t, plazo_restante, tasa, tabla)
 
-            qx = tabla.loc[tabla["Edad"] == edad_actual, "qx"].values[0]
-            v = 1 / ((1 + tasa) ** (k - t + 1))
-
-            valor_actual_beneficios += suma_asegurada * qx * v
-            valor_actual_primas_futuras += prima_riesgo * v
-
-        reserva = valor_actual_beneficios - valor_actual_primas_futuras
-
-        if reserva < 0:
-            reserva = 0
-
+        reserva = (suma_asegurada * A) - (prima_neta * a)
         reservas.append(reserva)
 
     return reservas
 
 
-# -----------------------------
-# Cálculos
-# -----------------------------
-prima_riesgo = calcular_prima_riesgo(
-    edad,
-    plazo,
-    suma_asegurada,
-    tasa,
-    tabla_mortalidad
+A = seguro_temporal(edad, plazo, tasa, tabla_mortalidad)
+a = anualidad_temporal(edad, plazo, tasa, tabla_mortalidad)
+
+prima_neta_anual = (suma_asegurada * A) / a
+
+prima_comercial_anual = prima_neta_anual * (
+    1 + gastos_admin + gastos_adquisicion + utilidad
 )
 
-prima_total_anual = prima_riesgo * (1 + gastos_admin + gastos_adquisicion + utilidad)
-prima_mensual = prima_total_anual / 12
+prima_mensual = prima_comercial_anual / 12
 
 reservas = calcular_reservas(
     edad,
     plazo,
     suma_asegurada,
-    prima_riesgo,
+    prima_neta_anual,
     tasa,
     tabla_mortalidad
 )
@@ -187,33 +161,28 @@ df_reservas = pd.DataFrame({
     "Reserva matemática": reservas
 })
 
-# -----------------------------
-# Resultados
-# -----------------------------
 st.subheader("Resultados")
 
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    st.metric("Prima de riesgo anual", f"${prima_riesgo:,.2f}")
+    st.metric("Prima neta anual", f"${prima_neta_anual:,.2f}")
 
 with col2:
-    st.metric("Prima total anual", f"${prima_total_anual:,.2f}")
+    st.metric("Prima comercial anual", f"${prima_comercial_anual:,.2f}")
 
 with col3:
     st.metric("Prima mensual", f"${prima_mensual:,.2f}")
 
-# -----------------------------
-# Tabla de reservas
-# -----------------------------
-st.subheader("Tabla de reservas")
+st.info(
+    "La reserva matemática se calcula de forma prospectiva: "
+    "valor presente actuarial de beneficios futuros menos valor presente actuarial de primas futuras."
+)
 
+st.subheader("Tabla de reservas")
 st.dataframe(df_reservas, use_container_width=True)
 
-# -----------------------------
-# Gráfico de reserva
-# -----------------------------
-st.subheader("Gráfico de reserva matemática")
+st.subheader("Gráfica de reserva matemática")
 
 fig, ax = plt.subplots()
 
@@ -230,9 +199,6 @@ ax.grid(True)
 
 st.pyplot(fig)
 
-# -----------------------------
-# Tabla de mortalidad
-# -----------------------------
 with st.expander("Ver tabla de mortalidad usada"):
     st.dataframe(tabla_mortalidad, use_container_width=True)
 
